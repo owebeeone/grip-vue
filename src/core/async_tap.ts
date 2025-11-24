@@ -759,6 +759,12 @@ export abstract class BaseAsyncTap extends BaseTap {
   ): void {
     const state = this.getDestState(dest);
 
+    // Guard against recursion: if keys already match, no change needed
+    const currentKey = state.key ?? state.requestKey ?? null;
+    if (currentKey === newKey) {
+      return;
+    }
+
     // Cancel old retry/refresh timers
     if (state.retryTimer) {
       clearTimeout(state.retryTimer);
@@ -780,7 +786,8 @@ export abstract class BaseAsyncTap extends BaseTap {
     // Reset retry attempt counter for new key
     state.retryAttempt = 0;
 
-    // Update request key
+    // Update both key and requestKey to prevent recursion
+    state.key = newKey ?? undefined;
     state.requestKey = newKey;
 
     // Add history entry for key change (preserve history, mark with new key)
@@ -798,6 +805,7 @@ export abstract class BaseAsyncTap extends BaseTap {
         { type: "loading", initiatedAt: Date.now(), retryAt: null },
         "request_initiated",
       );
+      // Call kickoff with a flag to skip key change detection since we've already handled it
       this.kickoff(dest, false);
     } else {
       // No key available, reset to idle
@@ -904,6 +912,8 @@ export abstract class BaseAsyncTap extends BaseTap {
           // Request key changed
           this.handleRequestKeyChange(dest, oldKey, key);
         } else {
+          // Update both key and requestKey
+          state.key = key;
           state.requestKey = key;
         }
       }
