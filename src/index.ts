@@ -62,5 +62,30 @@ export { GraphDumpKeyRegistry, GripGraphDumper } from "./core/graph_dump";
 export { LruTtlCache } from "./core/async_cache";
 export { createDebouncer } from "./core/debounce";
 
+// Async request state types and helpers (Phase 0)
+export type {
+  RequestState,
+  AsyncRequestState,
+  AsyncTapController,
+  RetryConfig,
+  StateHistoryEntry,
+} from "./core/async_request_state";
+export {
+  hasData,
+  isStale,
+  isRefreshing,
+  isRefreshingWithData,
+  hasError,
+  getError,
+  isLoading,
+  isIdle,
+  getDataRetrievedAt,
+  getRequestInitiatedAt,
+  getErrorFailedAt,
+  hasScheduledRetry,
+  getRetryTimeRemaining,
+  getStatusMessage,
+} from "./core/async_state_helpers";
+
 // Logging helper
 export { getLoggingTagsGrip } from "./logging";

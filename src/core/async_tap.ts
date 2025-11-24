@@ -30,6 +30,13 @@ import type { AsyncCache } from "./async_cache";
 import { LruTtlCache } from "./async_cache";
 import type { Tap } from "./tap";
 import type { GripRecord, GripValue, Values, FunctionTapHandle } from "./function_tap";
+import type {
+  RequestState,
+  AsyncRequestState,
+  AsyncTapController,
+  RetryConfig,
+  StateHistoryEntry,
+} from "./async_request_state";
 import { consola } from "consola";
 
 const logger = consola.withTag("core/async_tap.ts");
@@ -43,13 +50,25 @@ const logger = consola.withTag("core/async_tap.ts");
  * - Request keys for caching and deduplication
  * - Deadline timers for request timeouts
  * - Retry state for failed requests
+ * - Phase 2: State tracking fields
  */
 interface DestState {
-  controller?: AbortController;
+  controller?: AbortController; // Phase 2: Keep for backward compatibility, will use abortController
+  abortController?: AbortController; // Phase 2: Dedicated AbortController for in-flight requests
   seq: number;
-  key?: string;
+  key?: string; // Phase 2: Keep for backward compatibility, will use requestKey
+  requestKey?: string | null; // Phase 2: The cache key for this request
   deadlineTimer?: any;
   pendingRetryArmed?: boolean;
+  // Phase 2: State tracking fields
+  currentState: RequestState;
+  listenerCount: number;
+  retryAttempt: number;
+  retryTimer?: any | null;
+  refreshTimer?: any | null;
+  history: StateHistoryEntry[];
+  historySize: number;
+  tapController?: AsyncTapController; // Controller instance (different from AbortController)
 }
 
 /**
@@ -60,6 +79,9 @@ interface DestState {
  * @param cacheTtlMs - Cache TTL in milliseconds (0 = no caching)
  * @param latestOnly - Only process latest request per destination (default: true)
  * @param deadlineMs - Request timeout in milliseconds (0 = no timeout)
+ * @param historySize - Number of state transitions to keep in history (default: 10, 0 = disabled)
+ * @param retry - Retry configuration for exponential backoff
+ * @param refreshBeforeExpiryMs - Refresh data before TTL expires (milliseconds before expiry)
  */
 export interface BaseAsyncTapOptions {
   debounceMs?: number;
@@ -67,6 +89,9 @@ export interface BaseAsyncTapOptions {
   cacheTtlMs?: number;
   latestOnly?: boolean;
   deadlineMs?: number;
+  historySize?: number; // Phase 0: Number of state transitions to keep in history (default: 10, 0 = disabled)
+  retry?: RetryConfig; // Phase 0: Retry configuration for exponential backoff
+  refreshBeforeExpiryMs?: number; // Phase 0: Refresh data before TTL expires (milliseconds before expiry)
 }
 
 /**
@@ -86,21 +111,38 @@ export interface BaseAsyncTapOptions {
  * - getResetUpdates: Generate reset values when request fails
  */
 export abstract class BaseAsyncTap extends BaseTap {
-  protected readonly asyncOpts: Required<BaseAsyncTapOptions>;
+  protected readonly asyncOpts: Required<Omit<BaseAsyncTapOptions, "retry">> & {
+    retry?: RetryConfig;
+  };
   private readonly destState = new WeakMap<GripContext, DestState>();
   private readonly cache: AsyncCache<string, unknown>;
   private readonly pending = new Map<string, Promise<unknown>>();
   private readonly allControllers = new Set<AbortController>();
   private readonly allTimers = new Set<any>();
+  // Phase 0: Optional state and controller Grips
+  readonly stateGrip?: Grip<AsyncRequestState>;
+  readonly controllerGrip?: Grip<AsyncTapController>;
 
   constructor(opts: {
     provides: readonly Grip<any>[];
     destinationParamGrips?: readonly Grip<any>[];
     homeParamGrips?: readonly Grip<any>[];
     async?: BaseAsyncTapOptions;
+    // Phase 0: Optional state and controller Grips
+    stateGrip?: Grip<AsyncRequestState>;
+    controllerGrip?: Grip<AsyncTapController>;
   }) {
+    // Phase 2: Add state and controller Grips to provides if they exist
+    const providesList: Grip<any>[] = [...opts.provides];
+    if (opts.stateGrip) {
+      providesList.push(opts.stateGrip);
+    }
+    if (opts.controllerGrip) {
+      providesList.push(opts.controllerGrip);
+    }
+
     super({
-      provides: opts.provides,
+      provides: providesList,
       destinationParamGrips: opts.destinationParamGrips,
       homeParamGrips: opts.homeParamGrips,
     });
@@ -111,8 +153,14 @@ export abstract class BaseAsyncTap extends BaseTap {
       cacheTtlMs: a.cacheTtlMs ?? 0,
       latestOnly: a.latestOnly ?? true,
       deadlineMs: a.deadlineMs ?? 0,
+      historySize: a.historySize ?? 10, // Phase 0: Default history size
+      retry: a.retry, // Phase 0: Retry config (optional)
+      refreshBeforeExpiryMs: a.refreshBeforeExpiryMs ?? 0, // Phase 0: Default no refresh before expiry
     };
     this.cache = this.asyncOpts.cache;
+    // Phase 0: Store optional state and controller Grips
+    this.stateGrip = opts.stateGrip;
+    this.controllerGrip = opts.controllerGrip;
   }
 
   /**
@@ -121,7 +169,18 @@ export abstract class BaseAsyncTap extends BaseTap {
   protected getDestState(dest: GripContext): DestState {
     let s = this.destState.get(dest);
     if (!s) {
-      s = { seq: 0 };
+      // Phase 2: Initialize state tracking fields
+      s = {
+        seq: 0,
+        currentState: { type: "idle", retryAt: null },
+        listenerCount: 0,
+        retryAttempt: 0,
+        retryTimer: null,
+        refreshTimer: null,
+        history: [],
+        historySize: this.asyncOpts.historySize,
+        requestKey: null,
+      };
       this.destState.set(dest, s);
     }
     return s;
@@ -154,6 +213,340 @@ export abstract class BaseAsyncTap extends BaseTap {
    * Generate reset values when request fails or parameters are insufficient.
    */
   protected abstract getResetUpdates(params: DestinationParams): Map<Grip<any>, any>;
+
+  // Phase 2: State management methods
+  /**
+   * Get current request state for a destination context.
+   */
+  getRequestState(dest: GripContext): AsyncRequestState {
+    const state = this.getDestState(dest);
+    return {
+      state: state.currentState,
+      requestKey: state.requestKey ?? null,
+      hasListeners: state.listenerCount > 0,
+      history: Object.freeze([...state.history]) as ReadonlyArray<StateHistoryEntry>,
+    };
+  }
+
+  /**
+   * Manually trigger a retry for a destination context.
+   */
+  protected retry(dest: GripContext, forceRefetch?: boolean): void {
+    throw new Error("Not implemented - Phase 0");
+  }
+
+  /**
+   * Manually trigger a refresh for a destination context.
+   */
+  protected refresh(dest: GripContext, forceRefetch?: boolean): void {
+    throw new Error("Not implemented - Phase 0");
+  }
+
+  /**
+   * Reset the state for a destination context.
+   */
+  protected reset(dest: GripContext): void {
+    throw new Error("Not implemented - Phase 0");
+  }
+
+  /**
+   * Cancel any scheduled retries for a destination context.
+   */
+  protected cancelRetry(dest: GripContext): void {
+    const state = this.getDestState(dest);
+
+    if (state.retryTimer) {
+      clearTimeout(state.retryTimer);
+      this.allTimers.delete(state.retryTimer);
+      state.retryTimer = null;
+    }
+
+    // Clear retryAt in state
+    if (state.currentState.retryAt !== null) {
+      state.currentState = { ...state.currentState, retryAt: null };
+      this.publishState(dest);
+    }
+  }
+
+  /**
+   * Publish state to state Grip for a destination.
+   */
+  private publishState(dest: GripContext): void {
+    if (!this.stateGrip || !this.engine || !this.homeContext || !this.producer) {
+      return;
+    }
+
+    // Phase 3: Recalculate listener count based on current destination state
+    // The Destination record is removed when there are no more listeners, so if it doesn't exist, count is 0
+    const state = this.getDestState(dest);
+    const destination = this.getDestination(dest);
+    if (destination) {
+      // Count only output Grips (not state or controller Grips)
+      let outputGripCount = 0;
+      for (const g of destination.getGrips()) {
+        if (this.isOutputGrip(g)) {
+          outputGripCount++;
+        }
+      }
+      state.listenerCount = outputGripCount;
+    } else {
+      // Destination doesn't exist = no listeners
+      state.listenerCount = 0;
+    }
+
+    const asyncState = this.getRequestState(dest);
+    const updates = new Map<Grip<any>, any>([[this.stateGrip, asyncState]]);
+    this.publish(updates, dest);
+  }
+
+  /**
+   * Publish controller to controller Grip for a destination.
+   */
+  private publishController(dest: GripContext): void {
+    throw new Error("Not implemented - Phase 0");
+  }
+
+  /**
+   * Create controller closure for a destination.
+   */
+  private createController(dest: GripContext): AsyncTapController {
+    throw new Error("Not implemented - Phase 0");
+  }
+
+  /**
+   * Add history entry for state transition.
+   * Captures the previous state (state being exited) with the timestamp of transition.
+   */
+  private addHistoryEntry(
+    dest: GripContext,
+    newState: RequestState,
+    reason?: string,
+  ): void {
+    const state = this.getDestState(dest);
+
+    if (state.historySize === 0) {
+      // History disabled, just update current state
+      state.currentState = newState;
+      this.publishState(dest);
+      return;
+    }
+
+    // Create history entry with previous state (state being exited)
+    const entry: StateHistoryEntry = {
+      state: state.currentState, // Previous state
+      timestamp: Date.now(),
+      requestKey: state.requestKey ?? null,
+      transitionReason: reason,
+    };
+
+    state.history.push(entry);
+
+    // Maintain circular buffer
+    if (state.history.length > state.historySize) {
+      state.history.shift(); // Remove oldest entry
+    }
+
+    // Update current state
+    state.currentState = newState;
+
+    this.publishState(dest);
+  }
+
+  /**
+   * Calculate retry delay using exponential backoff.
+   * Returns the timestamp when retry should occur, or null if max retries reached.
+   */
+  private calculateRetryDelay(attempt: number, baseTime: number = Date.now()): number | null {
+    const retryConfig = this.asyncOpts.retry;
+    if (!retryConfig) {
+      return null; // No retry config, no retry
+    }
+
+    const maxRetries = retryConfig.maxRetries ?? 3;
+    if (attempt >= maxRetries) {
+      return null; // Max retries reached
+    }
+
+    // Check if error is retryable (if predicate provided)
+    // Note: We can't check the error here since we're scheduling, not executing
+    // The error check will happen in executeRetry if needed
+
+    const initialDelay = retryConfig.initialDelayMs ?? 1000;
+    const backoffMultiplier = retryConfig.backoffMultiplier ?? 2;
+    const maxDelay = retryConfig.maxDelayMs ?? 30000;
+
+    const delay = Math.min(
+      initialDelay * Math.pow(backoffMultiplier, attempt),
+      maxDelay,
+    );
+
+    return baseTime + delay;
+  }
+
+  /**
+   * Schedule retry with exponential backoff.
+   * Only schedules if listeners exist and retry config is provided.
+   */
+  private scheduleRetry(dest: GripContext): void {
+    const state = this.getDestState(dest);
+
+    // Recalculate listener count to ensure it's accurate
+    // (Destination might have been updated since last publishState call)
+    const destination = this.getDestination(dest);
+    if (destination) {
+      let outputGripCount = 0;
+      for (const g of destination.getGrips()) {
+        if (this.isOutputGrip(g)) {
+          outputGripCount++;
+        }
+      }
+      state.listenerCount = outputGripCount;
+    } else {
+      // Destination doesn't exist = no listeners
+      state.listenerCount = 0;
+    }
+
+    // Don't schedule retry if no listeners
+    if (state.listenerCount === 0) {
+      return;
+    }
+
+    // Don't schedule if no retry config
+    if (!this.asyncOpts.retry) {
+      return;
+    }
+
+    // Cancel any existing retry timer
+    if (state.retryTimer) {
+      clearTimeout(state.retryTimer);
+      this.allTimers.delete(state.retryTimer);
+      state.retryTimer = null;
+    }
+
+    // Calculate retry delay
+    const retryAt = this.calculateRetryDelay(state.retryAttempt, Date.now());
+    if (retryAt === null) {
+      // Max retries reached, don't schedule
+      return;
+    }
+
+    // Increment retry attempt (for next retry calculation)
+    state.retryAttempt += 1;
+
+    // Update state with retryAt
+    const newState: RequestState = {
+      ...state.currentState,
+      retryAt,
+    };
+    this.addHistoryEntry(dest, newState, "retry_scheduled");
+
+    // Schedule retry timer
+    const delay = retryAt - Date.now();
+    const requestKey = state.requestKey;
+    if (requestKey) {
+      state.retryTimer = setTimeout(() => {
+        this.allTimers.delete(state.retryTimer!);
+        state.retryTimer = null;
+        this.executeRetry(dest, requestKey);
+      }, delay);
+      this.allTimers.add(state.retryTimer);
+    }
+  }
+
+  /**
+   * Execute scheduled retry.
+   * Checks listeners and request key before executing.
+   */
+  private executeRetry(dest: GripContext, requestKey: string): void {
+    const state = this.getDestState(dest);
+
+    // Check if listeners still exist
+    if (state.listenerCount === 0) {
+      // No listeners, cancel retry
+      state.currentState = { ...state.currentState, retryAt: null };
+      this.publishState(dest);
+      return;
+    }
+
+    // Check if request key still matches
+    const params = this.getDestinationParams(dest);
+    const currentKey = params ? this.getRequestKey(params) : null;
+    if (currentKey !== requestKey) {
+      // Request key changed, cancel retry
+      // handleRequestKeyChange will be called elsewhere
+      state.currentState = { ...state.currentState, retryAt: null };
+      this.publishState(dest);
+      return;
+    }
+
+    // Check if error is retryable (if predicate provided)
+    const retryConfig = this.asyncOpts.retry;
+    if (retryConfig?.retryOnError) {
+      const error = state.currentState.type === "error" || state.currentState.type === "stale-with-error"
+        ? (state.currentState as any).error
+        : null;
+      if (error && !retryConfig.retryOnError(error)) {
+        // Error is not retryable, don't retry
+        state.currentState = { ...state.currentState, retryAt: null };
+        this.publishState(dest);
+        return;
+      }
+    }
+
+    // Execute retry - transition to loading and kickoff
+    if (state.currentState.type === "error") {
+      // Transition from error to loading
+      this.addHistoryEntry(
+        dest,
+        {
+          type: "loading",
+          initiatedAt: Date.now(),
+          retryAt: null, // Will be set by scheduleRetry if this retry fails
+        },
+        "retry_executed",
+      );
+    } else if (state.currentState.type === "stale-with-error") {
+      // Transition from stale-with-error to stale-while-revalidate
+      const retrievedAt = state.currentState.retrievedAt;
+      this.addHistoryEntry(
+        dest,
+        {
+          type: "stale-while-revalidate",
+          retrievedAt,
+          refreshInitiatedAt: Date.now(),
+          retryAt: null, // Will be set by scheduleRetry if this retry fails
+        },
+        "retry_executed",
+      );
+    }
+
+    // Kickoff new request (force refetch to bypass cache)
+    this.kickoff(dest, true);
+  }
+
+  /**
+   * Handle request key change (abort old, preserve history, reset counters).
+   */
+  private handleRequestKeyChange(
+    dest: GripContext,
+    oldKey: string,
+    newKey: string | null,
+  ): void {
+    throw new Error("Not implemented - Phase 0");
+  }
+
+  /**
+   * Check if a grip is an output Grip (data Grip, not state or controller Grip).
+   * Only output Grips count toward listenerCount for retry/refresh scheduling.
+   */
+  private isOutputGrip(grip: Grip<any>): boolean {
+    // State and controller Grips don't count as listeners
+    if (grip === this.stateGrip || grip === this.controllerGrip) {
+      return false;
+    }
+    // Output Grips are in the provides array (data Grips)
+    return this.provides.includes(grip);
+  }
 
   /**
    * Called when destination parameters change.
@@ -204,6 +597,38 @@ export abstract class BaseAsyncTap extends BaseTap {
     if ((this.producer?.getDestinations().size ?? 0) === 1) {
       super.onConnect(dest, grip);
     }
+
+    // Phase 3: Track listeners - only output Grips count
+    // Note: In GRIP, onConnect is called when a destination is first created.
+    // The Destination record contains all grips for this destination context.
+    // We count only output Grips (not state or controller Grips) as listeners.
+    const state = this.getDestState(dest);
+    const destination = this.getDestination(dest);
+    if (destination) {
+      // Count output Grips in this destination
+      let outputGripCount = 0;
+      for (const g of destination.getGrips()) {
+        if (this.isOutputGrip(g)) {
+          outputGripCount++;
+        }
+      }
+      state.listenerCount = outputGripCount;
+    } else {
+      // Destination doesn't exist yet (shouldn't happen in onConnect, but handle it)
+      state.listenerCount = 0;
+    }
+
+    // Track per-request-key
+    const params = this.getDestinationParams(dest);
+    if (params) {
+      const key = this.getRequestKey(params);
+      if (key) {
+        state.requestKey = key;
+      }
+    }
+
+    // Phase 2: Publish initial state when destination connects (after listener count is updated)
+    this.publishState(dest);
     this.kickoff(dest);
   }
 
@@ -214,18 +639,74 @@ export abstract class BaseAsyncTap extends BaseTap {
    */
   onDisconnect(dest: GripContext, grip: Grip<any>): void {
     try {
+      // Call super first to remove the grip from destination
+      super.onDisconnect(dest, grip);
+
       const s = this.destState.get(dest);
       if (s) {
+        // Phase 3: Track listeners - only output Grips count
+        // Recalculate listener count based on remaining output Grips in destination
+        const isOutputGrip = this.isOutputGrip(grip);
+        if (isOutputGrip) {
+          const destination = this.getDestination(dest);
+          if (destination) {
+            // Recalculate based on remaining Grips (grip has been removed by super.onDisconnect)
+            let outputGripCount = 0;
+            for (const g of destination.getGrips()) {
+              if (this.isOutputGrip(g)) {
+                outputGripCount++;
+              }
+            }
+            s.listenerCount = outputGripCount;
+          } else {
+            // Destination removed - no listeners
+            s.listenerCount = 0;
+          }
+
+          // Phase 3: Zero-listener behavior - cancel retries and TTL refreshes
+          if (s.listenerCount === 0) {
+            // Cancel retry timer (will be implemented in Phase 4)
+            if (s.retryTimer) {
+              clearTimeout(s.retryTimer);
+              this.allTimers.delete(s.retryTimer);
+              s.retryTimer = null;
+            }
+            // Cancel refresh timer (will be implemented in Phase 5)
+            if (s.refreshTimer) {
+              clearTimeout(s.refreshTimer);
+              this.allTimers.delete(s.refreshTimer);
+              s.refreshTimer = null;
+            }
+            // Clear retryAt in state
+            s.currentState = { ...s.currentState, retryAt: null };
+            // Clear controller (make no-op) - will be implemented in Phase 8
+            if (s.tapController) {
+              s.tapController = undefined;
+              this.publishController(dest);
+            }
+          }
+        }
+
         s.controller?.abort();
+        if (s.abortController) {
+          s.abortController.abort();
+          this.allControllers.delete(s.abortController);
+          s.abortController = undefined;
+        }
         if (s.deadlineTimer) {
           clearTimeout(s.deadlineTimer);
           this.allTimers.delete(s.deadlineTimer);
           s.deadlineTimer = undefined;
         }
-        this.destState.delete(dest);
+
+        // Phase 3: Publish updated state with listener count
+        this.publishState(dest);
+
+        // Only delete state if destination is removed (will be handled in later phases)
+        // For now, keep state for debugging
       }
-    } finally {
-      super.onDisconnect(dest, grip);
+    } catch (error) {
+      // Ignore errors during disconnect
     }
   }
 
@@ -265,13 +746,15 @@ export abstract class BaseAsyncTap extends BaseTap {
    */
   private kickoff(dest: GripContext, forceRefetch?: boolean): void {
     const state = this.getDestState(dest);
-    const prevKey = state.key;
+    const prevKey = state.key ?? state.requestKey ?? undefined;
 
     const params = this.getDestinationParams(dest);
     if (!params) {
       // Can't get params, abort and clear outputs
       if (state.controller) state.controller.abort();
+      if (state.abortController) state.abortController.abort();
       state.key = undefined;
+      state.requestKey = null;
       return;
     }
 
@@ -280,20 +763,71 @@ export abstract class BaseAsyncTap extends BaseTap {
     // Parameters insufficient - abort and reset outputs
     if (!key) {
       if (state.controller) state.controller.abort();
+      if (state.abortController) state.abortController.abort();
       state.key = undefined;
+      state.requestKey = null;
       const resets = this.getResetUpdates(params);
       if (resets.size > 0) this.publish(resets, dest);
       return;
     }
 
-    // Request key changed - abort previous request (stale-while-revalidate)
+    // Phase 2: Request key changed - handle state transition
     if (prevKey !== undefined && prevKey !== key) {
       if (state.controller) state.controller.abort();
+      if (state.abortController) state.abortController.abort();
+      // Phase 4: Cancel retry on request key change
+      this.cancelRetry(dest);
+      // Phase 4: Reset retry attempt counter for new key
+      state.retryAttempt = 0;
+      // Phase 2: Handle key change (will be fully implemented in Phase 10)
+      state.requestKey = key;
+    } else {
+      state.requestKey = key;
     }
 
     // Check cache first
     const cached = this.asyncOpts.cacheTtlMs > 0 && !forceRefetch ? this.cache.get(key) : undefined;
     if (cached) {
+      // Phase 2: Cache hit - transition to stale-while-revalidate if refresh initiated, otherwise success
+      // For now, if we have cached data and are initiating a request, use stale-while-revalidate
+      // This will be refined when TTL refresh is implemented in Phase 5
+      const hasData = state.currentState.type === "success" ||
+        state.currentState.type === "stale-while-revalidate" ||
+        state.currentState.type === "stale-with-error";
+      
+      if (hasData) {
+        // We have data, this is a refresh - use stale-while-revalidate
+        let retrievedAt = Date.now();
+        if (state.currentState.type === "success") {
+          retrievedAt = state.currentState.retrievedAt;
+        } else if (state.currentState.type === "stale-while-revalidate") {
+          retrievedAt = state.currentState.retrievedAt;
+        } else if (state.currentState.type === "stale-with-error") {
+          retrievedAt = state.currentState.retrievedAt;
+        }
+        this.addHistoryEntry(
+          dest,
+          {
+            type: "stale-while-revalidate",
+            retrievedAt,
+            refreshInitiatedAt: Date.now(),
+            retryAt: null,
+          },
+          "cache_hit_refresh_initiated",
+        );
+      } else {
+        // No previous data, cache hit - transition to success
+        this.addHistoryEntry(
+          dest,
+          {
+            type: "success",
+            retrievedAt: Date.now(),
+            retryAt: null,
+          },
+          "cache_hit",
+        );
+      }
+
       // Publish cached value to all destinations sharing this key
       state.key = key;
       const destinations = Array.from(this.producer?.getDestinations().keys() ?? []);
@@ -308,7 +842,9 @@ export abstract class BaseAsyncTap extends BaseTap {
         this.publish(updates, dctx);
         // Mark destination state to prevent repeated resets
         try {
-          this.getDestState(dctx).key = key;
+          const dstate = this.getDestState(dctx);
+          dstate.key = key;
+          dstate.requestKey = key;
         } catch {}
       }
       return;
@@ -357,14 +893,57 @@ export abstract class BaseAsyncTap extends BaseTap {
       return;
     }
 
-    // Start new request
+    // Phase 2: Start new request - transition to loading or stale-while-revalidate
     state.seq += 1;
     const seq = state.seq;
     if (state.controller) state.controller.abort();
+    if (state.abortController) {
+      state.abortController.abort();
+      this.allControllers.delete(state.abortController);
+    }
     const controller = new AbortController();
-    state.controller = controller;
+    state.controller = controller; // Keep for backward compatibility
+    state.abortController = controller; // Phase 2: Dedicated AbortController
     this.allControllers.add(controller);
     state.key = key;
+
+    // Phase 2: Determine initial state - loading (no data) or stale-while-revalidate (has data)
+    const hasData = state.currentState.type === "success" ||
+      state.currentState.type === "stale-while-revalidate" ||
+      state.currentState.type === "stale-with-error";
+    
+    if (hasData) {
+      // We have data, this is a refresh - use stale-while-revalidate
+      let retrievedAt = Date.now();
+      if (state.currentState.type === "success") {
+        retrievedAt = state.currentState.retrievedAt;
+      } else if (state.currentState.type === "stale-while-revalidate") {
+        retrievedAt = state.currentState.retrievedAt;
+      } else if (state.currentState.type === "stale-with-error") {
+        retrievedAt = state.currentState.retrievedAt;
+      }
+      this.addHistoryEntry(
+        dest,
+        {
+          type: "stale-while-revalidate",
+          retrievedAt,
+          refreshInitiatedAt: Date.now(),
+          retryAt: null,
+        },
+        "request_initiated",
+      );
+    } else {
+      // No data, initial load - use loading
+      this.addHistoryEntry(
+        dest,
+        {
+          type: "loading",
+          initiatedAt: Date.now(),
+          retryAt: null,
+        },
+        "request_initiated",
+      );
+    }
 
     // Set up deadline timer
     if (state.deadlineTimer) {
@@ -388,7 +967,22 @@ export abstract class BaseAsyncTap extends BaseTap {
         if (this.asyncOpts.cacheTtlMs > 0 && key)
           this.cache.set(key, result, this.asyncOpts.cacheTtlMs);
 
-        // Publish to all destinations sharing this key
+        // Phase 2: Collect destinations to update state for
+        const retrievedAt = Date.now();
+        const destinationsToUpdate: GripContext[] = [];
+        if (this.producer) {
+          for (const destNode of Array.from(this.producer.getDestinations().keys())) {
+            const dctx = destNode.get_context();
+            if (!dctx) continue;
+            const dparams = this.getDestinationParams(dctx);
+            if (!dparams) continue;
+            const k2 = this.getRequestKey(dparams);
+            if (k2 !== key) continue;
+            destinationsToUpdate.push(dctx);
+          }
+        }
+        
+        // Publish to all destinations sharing this key first
         if (!this.producer) {
           if (process.env.NODE_ENV !== "production")
             logger.error(
@@ -421,11 +1015,92 @@ export abstract class BaseAsyncTap extends BaseTap {
           const updates = this.mapResultToUpdates(dparams, result);
           this.publish(updates, dctx);
           try {
-            this.getDestState(dctx).key = key;
+            const dstate = this.getDestState(dctx);
+            dstate.key = key;
+            dstate.requestKey = key;
           } catch {}
         }
+
+        // Phase 2: Transition to success state for all destinations with this key (after data is published)
+        for (const dctx of destinationsToUpdate) {
+          const dstate = this.getDestState(dctx);
+          // Phase 4: Reset retry attempt counter on success
+          dstate.retryAttempt = 0;
+          // Cancel any scheduled retries (success means no retry needed)
+          if (dstate.retryTimer) {
+            clearTimeout(dstate.retryTimer);
+            this.allTimers.delete(dstate.retryTimer);
+            dstate.retryTimer = null;
+          }
+          this.addHistoryEntry(
+            dctx,
+            {
+              type: "success",
+              retrievedAt,
+              retryAt: null, // Will be set by TTL refresh in Phase 5
+            },
+            "fetch_success",
+          );
+        }
       })
-      .catch(() => {
+      .catch((error) => {
+        // Phase 2: Handle errors - transition to error or stale-with-error
+        if (!this.producer) return;
+        
+        const failedAt = Date.now();
+        for (const destNode of Array.from(this.producer.getDestinations().keys())) {
+          const dctx = destNode.get_context();
+          if (!dctx) continue;
+          const dparams = this.getDestinationParams(dctx);
+          if (!dparams) continue;
+          const k2 = this.getRequestKey(dparams);
+          if (k2 !== key) continue;
+          
+          const dstate = this.getDestState(dctx);
+          const hasData = dstate.currentState.type === "success" ||
+            dstate.currentState.type === "stale-while-revalidate" ||
+            dstate.currentState.type === "stale-with-error";
+          
+          if (hasData) {
+            // We have cached data, use stale-with-error
+            let retrievedAt = Date.now();
+            if (dstate.currentState.type === "success") {
+              retrievedAt = dstate.currentState.retrievedAt;
+            } else if (dstate.currentState.type === "stale-while-revalidate") {
+              retrievedAt = dstate.currentState.retrievedAt;
+            } else if (dstate.currentState.type === "stale-with-error") {
+              retrievedAt = dstate.currentState.retrievedAt;
+            }
+            this.addHistoryEntry(
+              dctx,
+              {
+                type: "stale-with-error",
+                retrievedAt,
+                error: error instanceof Error ? error : new Error(String(error)),
+                failedAt,
+                retryAt: null, // Will be set by scheduleRetry if listeners exist
+              },
+              "fetch_error",
+            );
+          } else {
+            // No data, use error
+            this.addHistoryEntry(
+              dctx,
+              {
+                type: "error",
+                error: error instanceof Error ? error : new Error(String(error)),
+                failedAt,
+                retryAt: null, // Will be set by scheduleRetry if listeners exist
+              },
+              "fetch_error",
+            );
+          }
+
+          // Phase 4: Ensure state is published before scheduling retry (so listener count is up to date)
+          this.publishState(dctx);
+          // Phase 4: Schedule retry if configured and listeners exist
+          this.scheduleRetry(dctx);
+        }
         // Swallow network errors; optionally map to diagnostics in subclass
       })
       .finally(() => {
@@ -451,6 +1126,9 @@ export interface AsyncValueTapConfig<T> extends BaseAsyncTapOptions {
   homeParamGrips?: readonly Grip<any>[];
   requestKeyOf: (params: DestinationParams) => string | undefined;
   fetcher: (params: DestinationParams, signal: AbortSignal) => Promise<T>;
+  // Phase 0: Optional state and controller Grips
+  stateGrip?: Grip<AsyncRequestState>;
+  controllerGrip?: Grip<AsyncTapController>;
 }
 
 /**
@@ -465,6 +1143,9 @@ export interface AsyncHomeValueTapConfig<T> extends BaseAsyncTapOptions {
   homeParamGrips?: readonly Grip<any>[];
   requestKeyOf: (homeParams: ReadonlyMap<Grip<any>, any>) => string | undefined;
   fetcher: (homeParams: ReadonlyMap<Grip<any>, any>, signal: AbortSignal) => Promise<T>;
+  // Phase 0: Optional state and controller Grips
+  stateGrip?: Grip<AsyncRequestState>;
+  controllerGrip?: Grip<AsyncTapController>;
 }
 
 /**
@@ -483,6 +1164,9 @@ class SingleOutputAsyncTap<T> extends BaseAsyncTap {
       destinationParamGrips: cfg.destinationParamGrips,
       homeParamGrips: cfg.homeParamGrips,
       async: cfg,
+      // Phase 0: Pass state and controller Grips
+      stateGrip: cfg.stateGrip,
+      controllerGrip: cfg.controllerGrip,
     });
     this.out = cfg.provides;
     this.keyOf = cfg.requestKeyOf;
@@ -531,7 +1215,14 @@ class SingleOutputHomeAsyncTap<T> extends BaseAsyncTap {
   ) => Promise<T>;
 
   constructor(cfg: AsyncHomeValueTapConfig<T>) {
-    super({ provides: [cfg.provides], homeParamGrips: cfg.homeParamGrips, async: cfg });
+    super({
+      provides: [cfg.provides],
+      homeParamGrips: cfg.homeParamGrips,
+      async: cfg,
+      // Phase 0: Pass state and controller Grips
+      stateGrip: cfg.stateGrip,
+      controllerGrip: cfg.controllerGrip,
+    });
     this.out = cfg.provides;
     this.keyOf = cfg.requestKeyOf;
     this.fetcher = cfg.fetcher;
@@ -596,6 +1287,9 @@ export interface AsyncMultiTapConfig<
     result: R,
     getState: <K extends keyof StateRec>(grip: StateRec[K]) => GripValue<StateRec[K]> | undefined,
   ) => ReadonlyMap<Values<Outs>, GripValue<Values<Outs>>>;
+  // Phase 0: Optional state and controller Grips
+  stateGrip?: Grip<AsyncRequestState>;
+  controllerGrip?: Grip<AsyncTapController>;
 }
 
 /**
@@ -628,6 +1322,9 @@ export interface AsyncHomeMultiTapConfig<
     result: R,
     getState: <K extends keyof StateRec>(grip: StateRec[K]) => GripValue<StateRec[K]> | undefined,
   ) => ReadonlyMap<Values<Outs>, GripValue<Values<Outs>>>;
+  // Phase 0: Optional state and controller Grips
+  stateGrip?: Grip<AsyncRequestState>;
+  controllerGrip?: Grip<AsyncTapController>;
 }
 
 /**
@@ -667,6 +1364,9 @@ class MultiOutputAsyncTap<Outs extends GripRecord, R, StateRec extends GripRecor
       destinationParamGrips: cfg.destinationParamGrips,
       homeParamGrips: cfg.homeParamGrips,
       async: cfg,
+      // Phase 0: Pass state and controller Grips
+      stateGrip: cfg.stateGrip,
+      controllerGrip: cfg.controllerGrip,
     });
     this.outs = cfg.provides;
     this.keyOf = cfg.requestKeyOf;
@@ -772,7 +1472,14 @@ class MultiOutputHomeAsyncTap<Outs extends GripRecord, R, StateRec extends GripR
     const providesList = (cfg.handleGrip
       ? [...cfg.provides, cfg.handleGrip]
       : cfg.provides) as unknown as readonly Grip<any>[];
-    super({ provides: providesList, homeParamGrips: cfg.homeParamGrips, async: cfg });
+    super({
+      provides: providesList,
+      homeParamGrips: cfg.homeParamGrips,
+      async: cfg,
+      // Phase 0: Pass state and controller Grips
+      stateGrip: cfg.stateGrip,
+      controllerGrip: cfg.controllerGrip,
+    });
     this.outs = cfg.provides;
     this.keyOf = cfg.requestKeyOf;
     this.fetcher = cfg.fetcher;

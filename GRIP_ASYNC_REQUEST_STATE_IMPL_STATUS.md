@@ -2,10 +2,10 @@
 
 Tracking implementation progress for async request state management. See `GRIP_ASYNC_REQUEST_STATE_IMPL_PLAN.md` for detailed phase descriptions.
 
-- [ ] Phase 0: Type Definitions and Interfaces (no implementation)
-- [ ] Phase 1: Helper Functions and State Building
-- [ ] Phase 2: State Tracking and Publishing to State Grip
-- [ ] Phase 3: Listener Tracking
+- [x] Phase 0: Type Definitions and Interfaces (no implementation)
+- [x] Phase 1: Helper Functions and State Building
+- [x] Phase 2: State Tracking and Publishing to State Grip
+- [x] Phase 3: Listener Tracking
 - [ ] Phase 4: Retry System
 - [ ] Phase 5: TTL Refresh Scheduling
 - [ ] Phase 6: History Tracking
