@@ -38,6 +38,37 @@ import { consola } from "./logger";
 const logger = consola.withTag("core/graph.ts");
 
 /**
+ * Tap-specific destination context for managing per-destination lifecycle.
+ *
+ * This interface allows Taps to provide destination-specific context objects
+ * that receive callbacks when Grips are added/removed and when the destination
+ * is being detached. This enables Taps to manage per-destination state and
+ * resources without relying on WeakMaps keyed by GripContext.
+ *
+ * The context is created once per destination via `Tap.createDestinationContext()`
+ * and stored directly on the Destination instance.
+ */
+export interface TapDestinationContext {
+  /**
+   * Called when a Grip (Drip) is added to this destination.
+   * @param grip - The Grip that was added
+   */
+  dripAdded?(grip: Grip<any>): void;
+
+  /**
+   * Called when a Grip (Drip) is removed from this destination.
+   * @param grip - The Grip that was removed
+   */
+  dripRemoved?(grip: Grip<any>): void;
+
+  /**
+   * Called when all listeners are gone (destination is being removed).
+   * This is the final cleanup callback before the destination is destroyed.
+   */
+  onDetach?(): void;
+}
+
+/**
  * Comprehensive interface for accessing destination and home parameters.
  *
  * Provides a unified API for Taps to access both destination-specific parameters
@@ -161,6 +192,8 @@ export class ProducerRecord {
   removeDestinationForContext(destCtx: GripContextNode): void {
     const destination = this.destinations.get(destCtx);
     if (destination) {
+      // Call cleanup to ensure onDetach is called
+      destination.cleanup();
       destination.unsubscribeAllDestinationParams();
       this.destinations.delete(destCtx);
     }
@@ -316,6 +349,9 @@ export class Destination implements DestinationParams {
   private readonly destinationParamDrips: Map<Grip<any>, Drip<any>> = new Map();
   private readonly destinationDripsSubs: Map<Grip<any>, Unsubscribe> = new Map();
 
+  // Tap-specific destination context (single object, stored directly on Destination)
+  private tapContext?: TapDestinationContext;
+
   /**
    * Creates a new Destination for a Tap at a specific consumer context.
    *
@@ -334,6 +370,20 @@ export class Destination implements DestinationParams {
     this.tap = tap;
     this.grips = new Set(grips ?? []);
     this.producer = producer;
+
+    // Create destination context if tap provides factory
+    // Store directly on Destination (no WeakMap needed)
+    if (tap.createDestinationContext) {
+      this.tapContext = tap.createDestinationContext(this);
+    }
+  }
+
+  /**
+   * Get the tap-specific destination context.
+   * Returns undefined if no context was created.
+   */
+  getTapContext(): TapDestinationContext | undefined {
+    return this.tapContext;
   }
 
   /**
@@ -422,6 +472,8 @@ export class Destination implements DestinationParams {
       this.registerDestinationParamDrips();
     }
     this.grips.add(g);
+    // Notify destination context
+    this.tapContext?.dripAdded?.(g);
     this.sanityCheck();
   }
 
@@ -434,13 +486,30 @@ export class Destination implements DestinationParams {
     try {
       if (!this.grips.has(g)) return;
       this.grips.delete(g);
+      // Notify destination context
+      this.tapContext?.dripRemoved?.(g);
       if (this.grips.size === 0) {
+        // Call onDetach when all listeners are gone
+        this.tapContext?.onDetach?.();
         // Unregister for destination params if this is the last destination grip removed.
         this.unregisterDestination();
       }
     } finally {
       this.sanityCheck();
     }
+  }
+
+  /**
+   * Call onDetach before cleanup (called from ProducerRecord.removeDestinationForContext).
+   * This handles cases where destination is removed without going through removeGrip
+   * (e.g., context GC'd, or explicit removal while still has grips).
+   */
+  cleanup(): void {
+    if (this.grips.size > 0) {
+      // Still has grips, but destination is being forcibly removed
+      this.tapContext?.onDetach?.();
+    }
+    // Note: If grips.size === 0, onDetach was already called in removeGrip
   }
 
   /**

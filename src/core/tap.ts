@@ -132,6 +132,20 @@ export interface Tap {
    * @param paramGrip - The parameter Grip that changed
    */
   produceOnDestParams?(destContext: GripContext | undefined, paramGrip: Grip<any>): void;
+
+  /**
+   * Optional factory function to create a destination-specific context.
+   * Called once when a Destination is first created for this tap.
+   *
+   * This allows Taps to manage per-destination state and resources without
+   * relying on WeakMaps keyed by GripContext. The returned context receives
+   * lifecycle callbacks when Grips are added/removed and when the destination
+   * is detached.
+   *
+   * @param destination - The Destination instance being created
+   * @returns A TapDestinationContext instance, or undefined if not needed
+   */
+  createDestinationContext?(destination: import("./graph").Destination): import("./graph").TapDestinationContext | undefined;
 }
 
 /**
