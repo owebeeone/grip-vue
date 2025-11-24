@@ -246,7 +246,38 @@ export abstract class BaseAsyncTap extends BaseTap {
    * Reset the state for a destination context.
    */
   protected reset(dest: GripContext): void {
-    throw new Error("Not implemented - Phase 0");
+    const state = this.getDestState(dest);
+
+    // Abort any in-flight request
+    if (state.abortController) {
+      state.abortController.abort();
+      state.abortController = undefined;
+    }
+
+    // Cancel any scheduled retries/refreshes
+    this.cancelRetry(dest);
+    if (state.refreshTimer) {
+      clearTimeout(state.refreshTimer);
+      this.allTimers.delete(state.refreshTimer);
+      state.refreshTimer = null;
+    }
+
+    // Clear history
+    state.history = [];
+    state.retryAttempt = 0;
+
+    // Reset state to idle
+    state.currentState = { type: "idle", retryAt: null };
+    state.requestKey = null;
+
+    // Clear outputs
+    const params = this.getDestinationParams(dest);
+    if (params) {
+      const resets = this.getResetUpdates(params);
+      if (resets.size > 0) this.publish(resets, dest);
+    }
+
+    this.publishState(dest);
   }
 
   /**
@@ -303,14 +334,92 @@ export abstract class BaseAsyncTap extends BaseTap {
    * Publish controller to controller Grip for a destination.
    */
   private publishController(dest: GripContext): void {
-    throw new Error("Not implemented - Phase 0");
+    if (!this.controllerGrip || !this.producer) {
+      return;
+    }
+
+    const state = this.getDestState(dest);
+    const controller = state.tapController || this.createNoOpController();
+
+    const updates = new Map<Grip<any>, any>([[this.controllerGrip, controller]]);
+    this.publish(updates, dest);
   }
 
   /**
    * Create controller closure for a destination.
    */
   private createController(dest: GripContext): AsyncTapController {
-    throw new Error("Not implemented - Phase 0");
+    return {
+      retry: (forceRefetch?: boolean) => {
+        const state = this.getDestState(dest);
+
+        // Abort any in-flight request
+        if (state.abortController) {
+          state.abortController.abort();
+          state.abortController = undefined;
+        }
+
+        // Cancel any scheduled retries/refreshes
+        this.cancelRetry(dest);
+        if (state.refreshTimer) {
+          clearTimeout(state.refreshTimer);
+          this.allTimers.delete(state.refreshTimer);
+          state.refreshTimer = null;
+        }
+
+        // Increment retry attempt (for exponential backoff)
+        state.retryAttempt += 1;
+
+        // Initiate new request
+        this.kickoff(dest, forceRefetch === true);
+      },
+      refresh: (forceRefetch?: boolean) => {
+        // Refresh doesn't increment retryAttempt
+        // Abort any in-flight request
+        const state = this.getDestState(dest);
+        if (state.abortController) {
+          state.abortController.abort();
+          state.abortController = undefined;
+        }
+
+        // Cancel any scheduled retries/refreshes
+        this.cancelRetry(dest);
+        if (state.refreshTimer) {
+          clearTimeout(state.refreshTimer);
+          this.allTimers.delete(state.refreshTimer);
+          state.refreshTimer = null;
+        }
+
+        // Initiate new request (will use stale-while-revalidate if data exists)
+        this.kickoff(dest, forceRefetch === true);
+      },
+      reset: () => {
+        this.reset(dest);
+      },
+      cancelRetry: () => {
+        this.cancelRetry(dest);
+      },
+      abort: () => {
+        const state = this.getDestState(dest);
+        if (state.abortController) {
+          state.abortController.abort();
+          state.abortController = undefined;
+        }
+      },
+    };
+  }
+
+  /**
+   * Create a no-op controller for destinations without active listeners.
+   */
+  private createNoOpController(): AsyncTapController {
+    return {
+      retry: () => {},
+      refresh: () => {},
+      reset: () => {},
+      cancelRetry: () => {},
+      abort: () => {},
+    };
   }
 
   /**
@@ -527,12 +636,179 @@ export abstract class BaseAsyncTap extends BaseTap {
   /**
    * Handle request key change (abort old, preserve history, reset counters).
    */
+  /**
+   * Calculate TTL refresh time.
+   * Returns the timestamp when refresh should occur, or null if no refresh needed.
+   */
+  private calculateRefreshTime(
+    retrievedAt: number,
+    ttlMs: number,
+    refreshBeforeExpiryMs: number = 0,
+  ): number | null {
+    if (ttlMs <= 0) return null; // No TTL, no scheduled refresh
+
+    const expiryTime = retrievedAt + ttlMs;
+    const refreshTime = expiryTime - refreshBeforeExpiryMs;
+
+    return refreshTime > Date.now() ? refreshTime : null;
+  }
+
+  /**
+   * Schedule TTL-based refresh.
+   * Only schedules if listeners exist and TTL is configured.
+   */
+  private scheduleRefresh(dest: GripContext): void {
+    const state = this.getDestState(dest);
+
+    // Don't schedule if no listeners
+    if (state.listenerCount === 0) {
+      return;
+    }
+
+    // Don't schedule if no TTL configured
+    if (this.asyncOpts.cacheTtlMs <= 0) {
+      return;
+    }
+
+    // Only schedule for states with data
+    let retrievedAt: number | null = null;
+    if (state.currentState.type === "success") {
+      retrievedAt = state.currentState.retrievedAt;
+    } else if (state.currentState.type === "stale-while-revalidate") {
+      retrievedAt = state.currentState.retrievedAt;
+    } else if (state.currentState.type === "stale-with-error") {
+      retrievedAt = state.currentState.retrievedAt;
+    } else {
+      return; // No data, no refresh to schedule
+    }
+
+    // Cancel any existing refresh timer
+    if (state.refreshTimer) {
+      clearTimeout(state.refreshTimer);
+      this.allTimers.delete(state.refreshTimer);
+      state.refreshTimer = null;
+    }
+
+    // Calculate refresh time
+    const refreshAt = this.calculateRefreshTime(
+      retrievedAt,
+      this.asyncOpts.cacheTtlMs,
+      this.asyncOpts.refreshBeforeExpiryMs,
+    );
+    if (refreshAt === null) {
+      return; // No refresh needed
+    }
+
+    // Schedule refresh timer
+    const delay = refreshAt - Date.now();
+    const requestKey = state.requestKey;
+    if (requestKey && delay > 0) {
+      state.refreshTimer = setTimeout(() => {
+        this.allTimers.delete(state.refreshTimer!);
+        state.refreshTimer = null;
+        this.executeRefresh(dest, requestKey);
+      }, delay);
+      this.allTimers.add(state.refreshTimer);
+    }
+  }
+
+  /**
+   * Execute scheduled TTL refresh.
+   * Checks listeners and request key before executing.
+   */
+  private executeRefresh(dest: GripContext, requestKey: string): void {
+    const state = this.getDestState(dest);
+
+    // Check if listeners still exist
+    if (state.listenerCount === 0) {
+      // No listeners, cancel refresh
+      return;
+    }
+
+    // Check if request key still matches
+    const params = this.getDestinationParams(dest);
+    const currentKey = params ? this.getRequestKey(params) : null;
+    if (currentKey !== requestKey) {
+      // Request key changed, cancel refresh
+      return;
+    }
+
+    // Execute refresh - use stale-while-revalidate
+    if (state.currentState.type === "success" || state.currentState.type === "stale-with-error") {
+      const retrievedAt = state.currentState.retrievedAt;
+      this.addHistoryEntry(
+        dest,
+        {
+          type: "stale-while-revalidate",
+          retrievedAt,
+          refreshInitiatedAt: Date.now(),
+          retryAt: null,
+        },
+        "ttl_refresh_executed",
+      );
+    }
+
+    // Kickoff refresh (use stale-while-revalidate pattern)
+    this.kickoff(dest, false); // Don't force refetch, use cache if available
+  }
+
   private handleRequestKeyChange(
     dest: GripContext,
     oldKey: string,
     newKey: string | null,
   ): void {
-    throw new Error("Not implemented - Phase 0");
+    const state = this.getDestState(dest);
+
+    // Cancel old retry/refresh timers
+    if (state.retryTimer) {
+      clearTimeout(state.retryTimer);
+      this.allTimers.delete(state.retryTimer);
+      state.retryTimer = null;
+    }
+    if (state.refreshTimer) {
+      clearTimeout(state.refreshTimer);
+      this.allTimers.delete(state.refreshTimer);
+      state.refreshTimer = null;
+    }
+
+    // Abort any in-flight request for old key
+    if (state.abortController) {
+      state.abortController.abort();
+      state.abortController = undefined;
+    }
+
+    // Reset retry attempt counter for new key
+    state.retryAttempt = 0;
+
+    // Update request key
+    state.requestKey = newKey;
+
+    // Add history entry for key change (preserve history, mark with new key)
+    this.addHistoryEntry(
+      dest,
+      { ...state.currentState, retryAt: null },
+      "request_key_changed",
+    );
+
+    // If new key is available, initiate new request
+    if (newKey) {
+      // Transition to loading (no cached data for new key yet)
+      this.addHistoryEntry(
+        dest,
+        { type: "loading", initiatedAt: Date.now(), retryAt: null },
+        "request_initiated",
+      );
+      this.kickoff(dest, false);
+    } else {
+      // No key available, reset to idle
+      const params = this.getDestinationParams(dest);
+      if (params) {
+        const resets = this.getResetUpdates(params);
+        if (resets.size > 0) this.publish(resets, dest);
+      }
+      state.currentState = { type: "idle", retryAt: null };
+      this.publishState(dest);
+    }
   }
 
   /**
@@ -623,9 +899,23 @@ export abstract class BaseAsyncTap extends BaseTap {
     if (params) {
       const key = this.getRequestKey(params);
       if (key) {
-        state.requestKey = key;
+        const oldKey = state.requestKey;
+        if (oldKey !== null && oldKey !== undefined && oldKey !== key) {
+          // Request key changed
+          this.handleRequestKeyChange(dest, oldKey, key);
+        } else {
+          state.requestKey = key;
+        }
       }
     }
+
+    // Phase 8: Create controller if controller Grip is provided
+    if (this.controllerGrip && !state.tapController) {
+      state.tapController = this.createController(dest);
+      this.publishController(dest);
+    }
+
+    this.publishState(dest);
 
     // Phase 2: Publish initial state when destination connects (after listener count is updated)
     this.publishState(dest);
@@ -679,15 +969,14 @@ export abstract class BaseAsyncTap extends BaseTap {
             }
             // Clear retryAt in state
             s.currentState = { ...s.currentState, retryAt: null };
-            // Clear controller (make no-op) - will be implemented in Phase 8
-            if (s.tapController) {
+            // Phase 8: Clear controller (make no-op) when listeners drop to zero
+            if (this.controllerGrip && s.tapController) {
               s.tapController = undefined;
               this.publishController(dest);
             }
           }
         }
 
-        s.controller?.abort();
         if (s.abortController) {
           s.abortController.abort();
           this.allControllers.delete(s.abortController);
@@ -762,7 +1051,6 @@ export abstract class BaseAsyncTap extends BaseTap {
 
     // Parameters insufficient - abort and reset outputs
     if (!key) {
-      if (state.controller) state.controller.abort();
       if (state.abortController) state.abortController.abort();
       state.key = undefined;
       state.requestKey = null;
@@ -771,16 +1059,11 @@ export abstract class BaseAsyncTap extends BaseTap {
       return;
     }
 
-    // Phase 2: Request key changed - handle state transition
+    // Phase 10: Request key changed - handle state transition
     if (prevKey !== undefined && prevKey !== key) {
-      if (state.controller) state.controller.abort();
-      if (state.abortController) state.abortController.abort();
-      // Phase 4: Cancel retry on request key change
-      this.cancelRetry(dest);
-      // Phase 4: Reset retry attempt counter for new key
-      state.retryAttempt = 0;
-      // Phase 2: Handle key change (will be fully implemented in Phase 10)
-      state.requestKey = key;
+      this.handleRequestKeyChange(dest, prevKey, key);
+      // handleRequestKeyChange already updates requestKey, so return early
+      return;
     } else {
       state.requestKey = key;
     }
@@ -1037,10 +1320,13 @@ export abstract class BaseAsyncTap extends BaseTap {
             {
               type: "success",
               retrievedAt,
-              retryAt: null, // Will be set by TTL refresh in Phase 5
+              retryAt: null, // Will be set by scheduleRefresh if TTL configured
             },
             "fetch_success",
           );
+          // Phase 5: Schedule TTL refresh if configured and listeners exist
+          this.publishState(dctx);
+          this.scheduleRefresh(dctx);
         }
       })
       .catch((error) => {
