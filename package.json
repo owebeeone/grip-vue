@@ -23,6 +23,7 @@
   "files": ["dist"],
   "scripts": {
     "build": "tsup src/index.ts --dts --format cjs,esm",
+    "dev": "tsup src/index.ts --dts --format cjs,esm --watch",
     "test": "vitest run --passWithNoTests"
   }
 }
