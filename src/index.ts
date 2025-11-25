@@ -19,7 +19,7 @@ export type { GripContext, GripContextLike } from "./core/context";
 export { Grok } from "./core/grok";
 
 // Graph types
-export type { GripContextNode } from "./core/graph";
+export type { GripContextNode, DestinationParams, HomeParams } from "./core/graph";
 
 // Drips
 export { Drip } from "./core/drip";

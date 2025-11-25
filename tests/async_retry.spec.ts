@@ -65,6 +65,7 @@ describe("Async Retry System", () => {
         initialDelayMs: 100,
         backoffMultiplier: 2,
       },
+      keepStaleDataOnTransition: true, // Preserve old behavior for retry tests
     });
     grok.registerTap(tap);
 
@@ -135,6 +136,7 @@ describe("Async Retry System", () => {
         maxRetries: 3,
         initialDelayMs: 100,
       },
+      keepStaleDataOnTransition: true, // Preserve old behavior for retry tests
     });
     grok.registerTap(tap);
 
@@ -174,6 +176,7 @@ describe("Async Retry System", () => {
         maxRetries: 3,
         initialDelayMs: 100,
       },
+      keepStaleDataOnTransition: true, // Preserve old behavior for retry tests
     });
     grok.registerTap(tap);
 
@@ -233,6 +236,7 @@ describe("Async Retry System", () => {
         maxRetries: 3,
         initialDelayMs: 100,
       },
+      keepStaleDataOnTransition: true, // Preserve old behavior for retry tests
     });
     grok.registerTap(tap);
 
@@ -294,6 +298,7 @@ describe("Async Retry System", () => {
         initialDelayMs: 50,
         backoffMultiplier: 2,
       },
+      keepStaleDataOnTransition: true, // Preserve old behavior for retry tests
     });
     grok.registerTap(tap);
 
@@ -353,6 +358,7 @@ describe("Async Retry System", () => {
         initialDelayMs: 50,
         backoffMultiplier: 2,
       },
+      keepStaleDataOnTransition: true, // Preserve old behavior for retry tests
     });
     grok.registerTap(tap);
 
@@ -410,6 +416,7 @@ describe("Async Retry System", () => {
         maxRetries: 3,
         initialDelayMs: 100,
       },
+      keepStaleDataOnTransition: true, // Preserve old behavior for retry tests
     });
     grok.registerTap(tap);
 

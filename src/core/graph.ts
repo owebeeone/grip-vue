@@ -98,6 +98,12 @@ export interface DestinationParams {
 }
 
 /**
+ * Type alias for home parameters map.
+ * Used by home-only async taps where all destinations share the same parameters.
+ */
+export type HomeParams = ReadonlyMap<Grip<any>, any>;
+
+/**
  * Manages a Tap's connections to multiple consumer contexts.
  *
  * A ProducerRecord represents a Tap's presence in the graph and manages

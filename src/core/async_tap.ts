@@ -111,6 +111,7 @@ export interface BaseAsyncTapOptions {
   retry?: RetryConfig; // Retry configuration for exponential backoff
   refreshBeforeExpiryMs?: number; // Refresh data before TTL expires (milliseconds before expiry)
   cleanupDelayMs?: number; // Delay before cleaning up shared request state when destinations drop to zero (default: 1000ms, 0 = immediate)
+  keepStaleDataOnTransition?: boolean; // If true, preserve stale data during transitions. If false (default), output undefined when data is not ready
 }
 
 /**
@@ -179,6 +180,7 @@ export abstract class BaseAsyncTap extends BaseTap {
       retry: a.retry, // Retry config (optional)
       refreshBeforeExpiryMs: a.refreshBeforeExpiryMs ?? 0, // Default no refresh before expiry
       cleanupDelayMs: a.cleanupDelayMs ?? 1000, // Default 1 second delay before cleanup
+      keepStaleDataOnTransition: a.keepStaleDataOnTransition ?? false, // Default: output undefined when not ready
     };
     this.cache = this.asyncOpts.cache;
     // Store optional state and controller Grips
@@ -1167,12 +1169,121 @@ export abstract class BaseAsyncTap extends BaseTap {
    */
   produceOnDestParams(destContext: GripContext | undefined): void {
     if (!destContext) return;
-    const params = this.getDestinationParams(destContext);
-    if (!params) return;
-    // Only kickoff when requestKey is resolvable
-    const key = this.getRequestKey(params);
-    if (!key) return;
-    this.kickoff(destContext);
+    this.produce({ destContext });
+  }
+
+  /**
+   * Check if all input parameters are defined.
+   * 
+   * Uses get() to match the behavior of requestKeyOf, which also uses get().
+   * This ensures consistency: if requestKeyOf can find a param via get(),
+   * allParamsDefined should also find it via get().
+   */
+  private allParamsDefined(params: DestinationParams | undefined): boolean {
+    if (!params) return false;
+
+    // Check destination params using get() to match requestKeyOf behavior
+    // get() checks destination params first, then falls back to home params
+    if (this.destinationParamGrips) {
+      for (const grip of this.destinationParamGrips) {
+        const value = params.get(grip);
+        if (value === undefined) {
+          return false;
+        }
+      }
+    }
+
+    // Check home params using getHomeParam() (home params don't fall back)
+    if (this.homeParamGrips) {
+      for (const grip of this.homeParamGrips) {
+        const value = params.getHomeParam(grip);
+        if (value === undefined) {
+          return false;
+        }
+      }
+    }
+
+    return true;
+  }
+
+  /**
+   * Check if data is ready based on request state and cache.
+   * 
+   * IMPORTANT: This preserves cached data if available and not expired.
+   * - success: Data is ready (but only if current request key matches state's request key)
+   * - stale-while-revalidate: Data exists, refreshing in background (preserve data, but only if keys match)
+   * - stale-with-error: Data exists, error during refresh (preserve data, but only if keys match)
+   * - loading: Check cache - if valid cached data exists, preserve it; otherwise undefined
+   * - error: Check cache - if valid cached data exists, preserve it; otherwise undefined
+   * - idle: Check cache - if valid cached data exists, preserve it; otherwise undefined
+   */
+  private isDataReady(state: RequestState, dest: GripContext): boolean {
+    // Get current request key from params
+    const params = this.getDestinationParams(dest);
+    if (!params) return false;
+
+    const currentRequestKey = this.getRequestKey(params);
+    
+    // Get the state's request key from destState
+    const destState = this.getDestState(dest);
+    const stateRequestKey = destState.requestKey;
+
+    // If current request key is undefined, data is not ready
+    if (!currentRequestKey) return false;
+
+    // If current request key doesn't match state's request key, data is not ready
+    // This handles the case where params changed and request key changed, but state still shows old success
+    if (stateRequestKey !== null && stateRequestKey !== currentRequestKey) {
+      return false;
+    }
+
+    switch (state.type) {
+      case "success":
+      case "stale-while-revalidate": // Preserve stale data during refresh
+      case "stale-with-error": // Preserve stale data even with error
+        // Keys match, data is ready
+        return true;
+      case "loading":
+      case "error":
+      case "idle": {
+        // Check cache for valid (non-expired) data
+        // Note: cache.get() returns CacheEntry<V> | undefined
+        // The cache automatically handles expiration - if expired, returns undefined
+        const cached = this.cache.get(currentRequestKey);
+        if (cached !== undefined) {
+          // We have valid cached data (cache already checked expiration)
+          // Preserve it even during loading/error/idle
+          return true;
+        }
+
+        // No cached data or expired - output undefined
+        return false;
+      }
+    }
+  }
+
+  /**
+   * Publish undefined for all output Grips to a specific destination.
+   * 
+   * NOTE: This clears ALL output Grips, even if only some depend on undefined inputs.
+   * For multi-output taps, consider clearing only dependent outputs (future enhancement).
+   */
+  private publishUndefined(dest: GripContext): void {
+    const updates = new Map<Grip<any>, any>();
+
+    // Set all output Grips to undefined
+    for (const grip of this.provides) {
+      // Skip state and controller Grips - they should still be published
+      if (grip === this.stateGrip || grip === this.controllerGrip) {
+        continue;
+      }
+      updates.set(grip, undefined);
+    }
+
+    if (updates.size > 0) {
+      logger.debug(`[AsyncTap] Publishing undefined for ${updates.size} output(s) to ${dest.id}`);
+      this.publish(updates, dest);
+    }
   }
 
   /**
@@ -1181,6 +1292,75 @@ export abstract class BaseAsyncTap extends BaseTap {
    * @param opts.forceRefetch - Bypass cache and force new request
    */
   produce(opts?: { destContext?: GripContext; forceRefetch?: boolean }): void {
+    // Default behavior: output undefined when not ready (unless keepStaleDataOnTransition is true)
+    if (!this.asyncOpts.keepStaleDataOnTransition) {
+      if (opts?.destContext) {
+        // Single destination
+        const params = this.getDestinationParams(opts.destContext);
+        const state = this.getDestState(opts.destContext);
+
+        // Check 1: Are all input parameters defined?
+        if (!this.allParamsDefined(params)) {
+          // Output undefined for all output Grips
+          logger.debug(`[AsyncTap] Params not defined, publishing undefined to ${opts.destContext.id}`);
+          this.publishUndefined(opts.destContext);
+        }
+
+        // Check 2: Does requestKeyOf return a valid key?
+        // This catches cases where params exist but are empty/invalid (e.g., empty string)
+        if (params) {
+          const requestKey = this.getRequestKey(params);
+          if (!requestKey) {
+            // Output undefined for all output Grips
+            logger.debug(`[AsyncTap] Request key is undefined, publishing undefined to ${opts.destContext.id}`);
+            this.publishUndefined(opts.destContext);
+          }
+        }
+
+        // Check 3: Is data ready? (preserves cached data if available)
+        if (!this.isDataReady(state.currentState, opts.destContext)) {
+          // Output undefined for all output Grips
+          this.publishUndefined(opts.destContext);
+        }
+      } else {
+        // All destinations - check each one
+        const destinations = Array.from(this.producer?.getDestinations().keys() ?? []);
+        for (const destNode of destinations) {
+          const destCtx = destNode.get_context();
+          if (!destCtx) continue;
+
+          const params = this.getDestinationParams(destCtx);
+          const state = this.getDestState(destCtx);
+
+          // Check 1: Are all input parameters defined?
+          if (!this.allParamsDefined(params)) {
+            logger.debug(`[AsyncTap] Params not defined, publishing undefined to ${destCtx.id}`);
+            this.publishUndefined(destCtx);
+            continue;
+          }
+
+          // Check 2: Does requestKeyOf return a valid key?
+          // This catches cases where params exist but are empty/invalid (e.g., empty string)
+          if (params) {
+            const requestKey = this.getRequestKey(params);
+            if (!requestKey) {
+              logger.debug(`[AsyncTap] Request key is undefined, publishing undefined to ${destCtx.id}`);
+              this.publishUndefined(destCtx);
+              continue;
+            }
+          }
+
+          // Check 3: Is data ready? (preserves cached data if available)
+          if (!this.isDataReady(state.currentState, destCtx)) {
+            this.publishUndefined(destCtx);
+            continue;
+          }
+        }
+      }
+    }
+    // If keepStaleDataOnTransition is true, continue with normal production (outputs last known value)
+
+    // Normal production logic - proceed with kickoff
     if (opts?.destContext) {
       this.kickoff(opts.destContext, opts.forceRefetch === true);
       return;
@@ -1335,8 +1515,11 @@ export abstract class BaseAsyncTap extends BaseTap {
       if (state.abortController) state.abortController.abort();
       state.key = undefined;
       state.requestKey = null;
-      const resets = this.getResetUpdates(params);
-      if (resets.size > 0) this.publish(resets, dest);
+      
+      if (!this.asyncOpts.keepStaleDataOnTransition) {
+        const resets = this.getResetUpdates(params);
+        if (resets.size > 0) this.publish(resets, dest);
+      }
       return;
     }
 
