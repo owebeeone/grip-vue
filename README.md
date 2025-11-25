@@ -93,14 +93,14 @@ const tempConverterTap = createFunctionTap({
   provides: [TEMP_FAHRENHEIT],
   destinationParamGrips: [TEMP_CELSIUS], // Read from destination context
   homeParamGrips: [UNIT_SYSTEM], // Read from home context
-  compute: (params, helpers) => {
-    const celsius = params.destination[TEMP_CELSIUS];
-    const unit = params.home[UNIT_SYSTEM];
+  compute: ({ getDestParam, getHomeParam }) => {
+    const celsius = getDestParam(TEMP_CELSIUS);
+    const unit = getHomeParam(UNIT_SYSTEM);
     
     if (unit === "imperial") {
-      return { [TEMP_FAHRENHEIT]: celsius * (9 / 5) + 32 };
+      return new Map([[TEMP_FAHRENHEIT, (celsius ?? 0) * (9 / 5) + 32]]);
     }
-    return { [TEMP_FAHRENHEIT]: celsius }; // No conversion
+    return new Map([[TEMP_FAHRENHEIT, celsius ?? 0]]); // No conversion
   },
 });
 
@@ -111,6 +111,8 @@ grok.registerTap(tempConverterTap);
 ### **3. BaseAsyncTap: Asynchronous Data Sources**
 
 Use `BaseAsyncTap` (or factory functions) for fetching data from APIs, databases, or other async sources. It handles caching, cancellation, and request deduplication. Async taps can optionally expose request state via a `stateGrip` (loading/success/error/stale) and a controller via `controllerGrip` (manual retry/refresh/reset).
+
+**Default Behavior**: By default, async taps output `undefined` when data is not ready (loading, error, idle states without valid cache). This propagates "not ready" state through dependency chains. Set `keepStaleDataOnTransition: true` to preserve stale data during transitions for UI stability.
 
 ```ts
   import {
@@ -140,27 +142,24 @@ const USER_DATA_CONTROLLER = defineGrip<AsyncTapController>("UserDataController"
 
 // Create an async tap that fetches user data
 const userDataTap = createAsyncValueTap({
-  provides: [USER_DATA],
+  provides: USER_DATA,
   stateGrip: USER_DATA_STATE, // optional: expose async request state
   controllerGrip: USER_DATA_CONTROLLER, // optional: expose retry/refresh/reset
   destinationParamGrips: [USER_ID], // Fetch based on user ID
-  requestKeyOf: (params) => params.destination[USER_ID], // Cache key
+  requestKeyOf: (params) => params.get(USER_ID) ?? undefined, // Cache key
   fetcher: async (params, signal) => {
-    const userId = params.destination[USER_ID];
+    const userId = params.get(USER_ID);
+    if (!userId) throw new Error("User ID required");
     const response = await fetch(`/api/users/${userId}`, { signal });
     return response.json();
   },
-  mapResult: (result) => ({
-    [USER_DATA]: result,
-  }),
-  opts: {
-    cache: new LruTtlCache({ maxSize: 100, ttlMs: 5 * 60 * 1000 }), // 5 min cache
-    cacheTtlMs: 5 * 60 * 1000,
-    latestOnly: true, // Ignore out-of-order responses
-    historySize: 10, // keep recent state transitions (0 to disable)
-    retry: { maxRetries: 3, initialDelayMs: 1000, backoffMultiplier: 2 },
-    refreshBeforeExpiryMs: 5000, // schedule refresh before TTL expiry
-  },
+  cacheTtlMs: 5 * 60 * 1000, // 5 min cache
+  latestOnly: true, // Ignore out-of-order responses
+  historySize: 10, // keep recent state transitions (0 to disable)
+  retry: { maxRetries: 3, initialDelayMs: 1000, backoffMultiplier: 2 },
+  refreshBeforeExpiryMs: 5000, // schedule refresh before TTL expiry
+  // keepStaleDataOnTransition: false (default) - outputs undefined when not ready
+  // Set to true to preserve stale data during loading/error/idle states
 });
 
 const grok = new Grok(registry);
@@ -175,14 +174,30 @@ Taps can declare two types of parameters that influence their behavior:
 
 Read from the destination (consumer) context lineage. Changes invalidate only that specific destination.
 
+**In Function Taps**: Use `getDestParam(grip)` to read destination parameters.
+
+**In Async Taps**: Use `params.get(grip)` for unified access (checks destination first, then home), or `params.getDestParam(grip)` for destination-specific access.
+
 ```ts
-// This tap produces different values per destination based on their context
+// Function tap example
 const tap = createFunctionTap({
   provides: [OUTPUT],
   destinationParamGrips: [LOCALE], // Each consumer can have different locale
-  compute: (params) => {
-    const locale = params.destination[LOCALE];
-    return { [OUTPUT]: formatForLocale(locale) };
+  compute: ({ getDestParam }) => {
+    const locale = getDestParam(LOCALE);
+    return new Map([[OUTPUT, formatForLocale(locale)]]);
+  },
+});
+
+// Async tap example
+const asyncTap = createAsyncValueTap({
+  provides: USER_DATA,
+  destinationParamGrips: [USER_ID],
+  requestKeyOf: (params) => params.get(USER_ID) ?? undefined,
+  fetcher: async (params, signal) => {
+    const userId = params.get(USER_ID); // Unified access
+    // or: const userId = params.getDestParam(USER_ID); // Destination-specific
+    return fetchUserData(userId);
   },
 });
 ```
@@ -191,14 +206,46 @@ const tap = createFunctionTap({
 
 Read from the provider's home context lineage. Changes invalidate all destinations under that provider.
 
+**In Function Taps**: Use `getHomeParam(grip)` to read home parameters.
+
+**In Async Taps**: Use `params.get(grip)` for unified access (checks destination first, then home), or `params.getHomeParam(grip)` for home-specific access.
+
 ```ts
-// This tap's behavior changes for all consumers when home parameter changes
+// Function tap example
 const tap = createFunctionTap({
   provides: [OUTPUT],
   homeParamGrips: [THEME], // All consumers see the same theme
-  compute: (params) => {
-    const theme = params.home[THEME];
-    return { [OUTPUT]: applyTheme(theme) };
+  compute: ({ getHomeParam }) => {
+    const theme = getHomeParam(THEME);
+    return new Map([[OUTPUT, applyTheme(theme)]]);
+  },
+});
+
+// Async tap example
+const asyncTap = createAsyncValueTap({
+  provides: API_CONFIG,
+  homeParamGrips: [API_BASE_URL],
+  requestKeyOf: (params) => params.getHomeParam(API_BASE_URL) ?? undefined,
+  fetcher: async (params, signal) => {
+    const baseUrl = params.getHomeParam(API_BASE_URL); // Home-specific
+    return fetchConfig(baseUrl);
+  },
+});
+```
+
+### **Unified Parameter Access**
+
+Async taps support unified parameter access via `params.get(grip)`, which checks destination parameters first, then falls back to home parameters. This simplifies taps that can work with either parameter type.
+
+```ts
+// Works with either destination or home parameter
+const tap = createAsyncValueTap({
+  provides: DATA,
+  destinationParamGrips: [ID], // Optional: can also be homeParamGrips
+  requestKeyOf: (params) => params.get(ID) ?? undefined, // Checks dest, then home
+  fetcher: async (params, signal) => {
+    const id = params.get(ID); // Unified access
+    return fetchData(id);
   },
 });
 ```
