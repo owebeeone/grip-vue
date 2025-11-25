@@ -2,9 +2,25 @@
   "name": "@owebeeone/grip-vue",
   "version": "0.1.0",
   "description": "Vue 3 integration for GRIP.",
-  "main": "dist/index.cjs",
+  "author": "Gianni Mariani",
+  "license": "MIT",
+  "main": "dist/index.js",
   "module": "dist/index.mjs",
   "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.mjs",
+      "require": "./dist/index.js"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/owebeeone/grip-vue.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
   "peerDependencies": {
     "vue": "^3.3.0",
     "@owebeeone/grip-core": "^0.1.0"
@@ -20,7 +36,7 @@
     "vue": "^3.4.0"
   },
   "sideEffects": false,
-  "files": ["dist"],
+  "files": ["dist", "README.md", "LICENSE"],
   "scripts": {
     "build": "tsup src/index.ts --dts --format cjs,esm",
     "dev": "tsup src/index.ts --dts --format cjs,esm --watch",
