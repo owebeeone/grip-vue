@@ -3,12 +3,22 @@ name: Publish GRIP Vue to npm
 on:
   release:
     types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to check and publish
+        required: true
+        type: string
+      prerelease:
+        description: Publish under the next distribution tag
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 env:
-  RELEASE_TAG: ${{ github.event.release.tag_name }}
+  RELEASE_TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
 jobs:
   verify:
@@ -58,10 +68,10 @@ jobs:
           path: artifacts
       - name: Publish with trusted publishing
         env:
-          PRERELEASE: ${{ github.event.release.prerelease }}
+          PRERELEASE: ${{ github.event.release.prerelease || inputs.prerelease || false }}
         run: |
           publish_tag=latest
           if [ "$PRERELEASE" = "true" ]; then
             publish_tag=next
           fi
-          npm publish artifacts/*.tgz --access public --provenance --tag "$publish_tag"
+          npm publish ./artifacts/*.tgz --access public --provenance --tag "$publish_tag"
