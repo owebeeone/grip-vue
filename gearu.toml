@@ -1,0 +1,18 @@
+[project]
+name = "grip-vue"
+branch = "main"
+remote = "origin"
+tag_prefix = "v"
+github_repo = "owebeeone/grip-vue"
+
+[npm]
+manifest = "package.json"
+
+[release]
+checks = [
+    ["npm", "ci"],
+    ["npm", "run", "check"],
+    ["node", "scripts/check-package.mjs"],
+]
+commit_message = "chore(release): grip-vue {version}"
+github_notes = "GRIP Vue {tag} adds keyed GripScope composition, GripInput and GripTextarea with focused edit buffers, and the useBufferedGripInput composable. Supports GRIP Core 0.3.0. Integration coverage checks scope identity, independent values, caret retention, partial numeric input, blur-only updates, IME composition, and subscription cleanup. Includes a checked-package release workflow using npm trusted publishing. Includes reusable GripGraphVisualizer, GraphDumpDialog and GraphDumpButton tools with live refresh, JSON snapshot options, clipboard copy and download. The source inspector remains demo-specific."

@@ -63,7 +63,7 @@ export function useTap(factory: () => Tap, opts?: { ctx?: GripContext | GripCont
   });
 
   onUnmounted(() => {
-    if (!tap) return;
+    if (!tap) { return; }
     const home = ctxLike.getGripHomeContext();
     home.unregisterTap(tap);
     tap = null;

@@ -9,9 +9,14 @@
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.js"
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
     }
   },
   "repository": {
@@ -22,14 +27,16 @@
     "access": "public"
   },
   "peerDependencies": {
-    "vue": "^3.3.0",
-    "@owebeeone/grip-core": "^0.2.0"
+    "@owebeeone/grip-core": "^0.3.0",
+    "vue": "^3.3.0"
   },
   "dependencies": {
-    "@owebeeone/grip-core": "^0.2.0"
+    "@owebeeone/grip-core": "^0.3.0"
   },
   "devDependencies": {
     "@types/node": "^20.11.30",
+    "@vue/test-utils": "^2.5.1",
+    "jsdom": "^26.1.0",
     "tsup": "^8.5.0",
     "typescript": "^5.9.2",
     "vitest": "^3.2.4",
@@ -44,6 +51,8 @@
   "scripts": {
     "build": "tsup src/index.ts --dts --format cjs,esm",
     "dev": "tsup src/index.ts --dts --format cjs,esm --watch",
-    "test": "vitest run --passWithNoTests"
+    "test": "vitest run",
+    "check:source": "node scripts/check-source.mjs",
+    "check": "npm run check:source && npm test && npm run build"
   }
 }

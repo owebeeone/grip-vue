@@ -1,0 +1,67 @@
+name: Publish GRIP Vue to npm
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ github.event.release.tag_name }}
+
+jobs:
+  verify:
+    name: Check and pack
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+      - run: npm ci
+      - name: Require tag and package version agreement
+        run: |
+          node -e 'const p=require("./package.json"); if (process.env.RELEASE_TAG !== `v${p.version}`) { throw new Error("Release tag must match the package version"); }'
+      - run: npm run check
+      - run: node scripts/check-package.mjs
+      - name: Pack the checked build
+        run: |
+          mkdir artifacts
+          npm pack --pack-destination artifacts
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-package
+          path: artifacts/*.tgz
+          if-no-files-found: error
+
+  publish:
+    name: Publish checked package
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: npm install --global npm@11
+      - uses: actions/download-artifact@v4
+        with:
+          name: npm-package
+          path: artifacts
+      - name: Publish with trusted publishing
+        env:
+          PRERELEASE: ${{ github.event.release.prerelease }}
+        run: |
+          publish_tag=latest
+          if [ "$PRERELEASE" = "true" ]; then
+            publish_tag=next
+          fi
+          npm publish artifacts/*.tgz --access public --provenance --tag "$publish_tag"

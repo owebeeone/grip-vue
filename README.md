@@ -171,7 +171,7 @@ Creates a child context for scoped data resolution. Useful for feature isolation
 <script setup lang="ts">
 import { useChildContext } from '@owebeeone/grip-vue';
 
-const childCtx = useChildContext();
+const childCtx = useChildContext(parent => parent.createChild());
 </script>
 ```
 
@@ -186,11 +186,10 @@ For advanced scenarios, you can provide a custom runtime in a component subtree:
 ```vue
 <script setup lang="ts">
 import { provideGripRuntime } from '@owebeeone/grip-vue';
-import { createChildContext } from '@owebeeone/grip-core';
 import { useGripRuntime } from '@owebeeone/grip-vue';
 
 const { grok, context } = useGripRuntime();
-const childCtx = createChildContext(context);
+const childCtx = context.getGripConsumerContext().createChild();
 
 provideGripRuntime({ grok, context: childCtx });
 </script>
@@ -240,28 +239,49 @@ const { data, loading, error, refetch } = useGripQuery(USER_DATA, {
 </script>
 ```
 
-## **Parameter Binding with `GripParams`**
+## Keyed scopes and buffered inputs
 
-`GripParams` provides a declarative way to bind component props to Grips:
+`GripScope` provides a keyed matching context to its descendants. `init` runs once for a new live context, so parent renders do not reset edited values. Use a stable column identity for `scope-key`; city and product selections belong in atoms. Changing the key remounts the scope subtree. Core owns context lifetime, including contexts shared under the same parent/key.
 
 ```vue
 <script setup lang="ts">
-import { GripParams, PARAMS_GRIP } from '@owebeeone/grip-vue';
-import { LOCALE, THEME } from './grips';
-
-interface Props {
-  locale?: string;
-  theme?: string;
+import { GripScope } from '@owebeeone/grip-vue';
+import { createAtomValueTap, type MatchingContext } from '@owebeeone/grip-core';
+import { LOCATION, LOCATION_TAP } from './grips';
+import WeatherColumn from './WeatherColumn.vue';
+function seed(context: MatchingContext) {
+  context.getGripHomeContext().registerTap(createAtomValueTap(LOCATION, {
+    initial: 'Sydney', handleGrip: LOCATION_TAP,
+  }));
 }
-
-const props = defineProps<Props>();
-
-// Bind props to Grips
-GripParams({
-  [LOCALE]: () => props.locale,
-  [THEME]: () => props.theme
-});
 </script>
+<template>
+  <GripScope scope-key="weather:left" :init="seed"><WeatherColumn /></GripScope>
+</template>
+```
+
+`GripInput` and `GripTextarea` bind a value grip and its atom handle grip. `parse` converts text to a value; returning `undefined` keeps incomplete input local. `format` converts provider values to text. Focused drafts and the caret survive provider echoes. Blur commits valid input and returns to the provider value. IME composition publishes after composition ends. Use `update="blur"` to defer publication; the default is `change`.
+
+```vue
+<GripInput :grip="DESCRIPTION" :tap-grip="DESCRIPTION_TAP"
+  :parse="text => text.toUpperCase()" aria-label="Description" />
+```
+
+For custom controls, `useBufferedGripInput(grip, tapGrip, options)` exposes a `text` ref, focus/input/blur/composition handlers, `commit()` and `reset()`. Grip identities are fixed for a component instance; use a Vue key to replace the component when changing its grips. The components forward ordinary attributes and event listeners to the native control.
+
+## **Parameter Binding with `GripParams`**
+
+`GripParams` registers bindings in the supplied context (or the current runtime context). It does not create an isolated scope. Use `GripScope` when each column needs separate state.
+
+```vue
+<script setup lang="ts">
+import { GripParams } from '@owebeeone/grip-vue';
+import { LOCALE } from './grips';
+defineProps<{ locale: string }>();
+</script>
+<template>
+  <GripParams :bindings="[{ grip: LOCALE, value: locale }]"><slot /></GripParams>
+</template>
 ```
 
 ## **TypeScript Support**
@@ -305,7 +325,9 @@ See the `grip-vue-demo` package for complete examples including:
 - Counter with atom taps
 - Calculator with function taps
 - Weather app with async taps
-- Context scoping and parameter binding
+- Independent weather and cryptocurrency columns
+- Keyed context scopes and buffered text editing
+- Live graph, JSON dump, and actual source inspection
 
 ## **API Reference**
 
@@ -315,16 +337,22 @@ See the `grip-vue-demo` package for complete examples including:
 - `useTap(factory, opts?)` - Register a Tap
 - `useGripRuntime()` - Access runtime
 - `useGripQuery<TData, TError>(grip, options?)` - Async data with states
-- `useChildContext()` - Create child context
+- `useChildContext(create)` - Create child context
+- `useBufferedGripInput(grip, tapGrip, options)` - Bind a focused text draft
 
 ### **Plugin**
 
 - `createGripPlugin(options)` - Vue plugin factory
 - `provideGripRuntime(runtime)` - Manual runtime provider
 
+### Components
+
+- `GripScope` - Provide a stable keyed matching context
+- `GripInput`, `GripTextarea` - Buffered native text controls
+
 ### **Utilities**
 
-- `GripParams(bindings)` - Parameter binding helper
+- `GripParams` - Declarative parameter binding component
 - `PARAMS_GRIP` - Special Grip for parameter binding
 
 ## **Related Packages**
@@ -338,3 +366,37 @@ See the `grip-vue-demo` package for complete examples including:
 - **Design Goals**: See `GRIP_DESIGN_GOALS.md`
 - **System Design**: See `Grip-Vue System Design Document 1.md`
 
+
+## Checks
+
+Run `npm run check` for the integration suite, explicit control-flow boundary check, and ESM/CommonJS/declaration builds. Tests use published Core 0.3.0. The boundary check covers the parity sources; the unchanged legacy `useGripQuery.ts` helper still needs a separate four-branch brace migration.
+
+## Trusted publishing
+
+The release workflow is `.github/workflows/publish.yml`. Configure the npm trusted publisher for `@owebeeone/grip-vue` with GitHub owner `owebeeone`, repository `grip-vue`, workflow filename `publish.yml`, and no environment. It needs direct publishing permission; separate dist-tag management is unnecessary.
+
+A published GitHub release checks that its `v`-prefixed tag matches `package.json`, installs locked dependencies, runs `npm run check`, and packs the checked build. A separate job publishes that exact tarball using OIDC with provenance. Stable releases use `latest`; GitHub prereleases use `next`. No npm token secret is required.
+
+Creating the trust connection does not publish a version. Commit and push the prepared changes, select a new package version, and create its matching GitHub release only when release publication is authorized. The first successful automated publication validates the npm connection.
+
+
+## Graph inspection tools
+
+`GripGraphVisualizer`, `GraphDumpButton` and `GraphDumpDialog` are reusable package exports. They take an explicit `grok` runtime, work without a GRIP plugin, and include their own styles. The demo imports these same components; only its example source-code viewer is demo-specific.
+
+```vue
+<script setup lang="ts">
+import { GripGraphVisualizer, GraphDumpButton, useGripRuntime } from '@owebeeone/grip-vue';
+const { grok } = useGripRuntime();
+</script>
+<template>
+  <div style="height: 500px; display: flex">
+    <GripGraphVisualizer :grok="grok" :refresh-ms="700" :fit-to-pane="true" />
+  </div>
+  <GraphDumpButton :grok="grok" />
+</template>
+```
+
+The visualizer shows context hierarchy, provider edges and consumer values. It supports `pause`, `refreshMs` (zero disables polling), `refreshTrigger` (increment to refresh), `fitToPane`, and `showReapedContexts`. Changing the runtime refreshes the graph; unmounting clears its timer. Give the containing pane a height when fitting the graph. Optional `keys` accepts a Core `GraphDumpKeyRegistry` to share identifiers with the dump dialog.
+
+The dump button opens a native modal dialog with value-inclusion options, manual snapshot refresh, clipboard copy and JSON download. For controlled visibility, use `<GraphDumpDialog :grok="grok" :open="open" @close="open = false" />`. These browser tools require native HTML dialog support. The dialog restores focus on dismissal; clipboard failures display a download alternative. Snapshots can contain application values, so select the inclusion options appropriate for what you intend to inspect or share.
