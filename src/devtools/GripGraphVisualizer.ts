@@ -9,6 +9,7 @@ import {
   type PropType,
 } from "vue";
 import { GripGraphDumper, type GraphDumpKeyRegistry, type Grok } from "@owebeeone/grip-core";
+import { GraphValueRow } from "./GraphValueRow";
 import { layoutGraph } from "./graphLayout";
 
 /** Standalone inspector: pass the runtime explicitly; no plugin or stylesheet required. */
@@ -137,10 +138,13 @@ export const GripGraphVisualizer = defineComponent({
                             .filter((drip) => drip.destContext === card.key)
                             .map((drip) =>
                               h(
-                                "div",
+                                GraphValueRow,
                                 {
                                   key: drip.key,
+                                  value: preview(drip.valuePreview ?? drip.value),
+                                  baseline: dumper.value,
                                   style: {
+                                    color: "#213547",
                                     display: "flex",
                                     flexWrap: "wrap",
                                     justifyContent: "space-between",
@@ -149,10 +153,10 @@ export const GripGraphVisualizer = defineComponent({
                                     overflowWrap: "anywhere",
                                   },
                                 },
-                                [
-                                  h("span", { style: { color: "#67788d" } }, drip.grip),
+                                { default: () => [
+                                  h("span", { style: { color: "inherit" } }, drip.grip),
                                   h("output", preview(drip.valuePreview ?? drip.value)),
-                                ],
+                                ] },
                               ),
                             ),
                         ]),
